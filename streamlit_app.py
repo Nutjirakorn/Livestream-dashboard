@@ -1,94 +1,48 @@
 """
 Supersports Live Schedule & Performance dashboard (Streamlit).
 
-Reads the Shopee and TikTok Google Sheets directly, applies the same mapping as the
-claude.ai dashboard, and reloads automatically when any sheet is edited.
+Reads three Google Sheets directly and refreshes automatically:
+  1. Shopee_Live_Tracking            -> sheet "Report - By Live"
+  2. TikTok - Jazz Working File      -> sheets "Daily Live Calendar" and "Live Raw Data"
+  3. Supersports TT Brief-Supersports Performance
+                                     -> sheet "Live Template(NEW)" and every monthly "<Mon>[YY] Perf" sheet
+                                        (or a "Live Raw Data" sheet, if one is added later)
 
-Setup: see README.md (service account in .streamlit/secrets.toml, share the sheets with it).
+Setup: see the README section at the bottom of this file.
 """
-from __future__ import annotations
 
-import datetime as dt
 import re
-import time
-from zoneinfo import ZoneInfo
+import datetime as dt
+from calendar import monthrange
 
-import gspread
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-from google.oauth2.service_account import Credentials
-
-try:  # optional: re-runs the page on a timer so new sheet data shows up by itself
-    from streamlit_autorefresh import st_autorefresh
-except ImportError:  # pragma: no cover
-    st_autorefresh = None
 
 # ----------------------------------------------------------------------------
 # Settings
 # ----------------------------------------------------------------------------
-SHOPEE_ID = "1RpP3HY6yTYnFqxFpF0NhwBRa70hCbynroZddm17dLIo"       # Shopee_Live_Tracking
-TT_SUPERSPORTS_ID = "1yJU84We3_yzPScbhKMv3pjcaiuv8IzWhHlgcD3Z-jO4"  # TikTok - Jazz Working File
-TT_PERFORMANCE_ID = "1b0olOO85X6zsK2WCW1XeV2XhC5tq8IJmZNLZpUWiuEw"  # Supersports TT Brief-Supersports Performance
-
-SHOPEE_SHEET = "Report - By Live"
-TT_CALENDAR_SHEET = "Daily Live Calendar"
-TT_RAW_SHEET = "Live Raw Data"
-TT_PERF_TEMPLATE_SHEET = "Live Template(NEW)"
-TT_PERF_RAW_SHEET = "Live Raw Data"  # used if it is ever added to the Performance file
-
-CHECK_EVERY_SECONDS = 60          # how often the page checks whether a sheet changed
-FALLBACK_RELOAD_MINUTES = 10      # reload interval if the change check is not available
-TZ = ZoneInfo("Asia/Bangkok")
-
-SH_COLOR, TT_COLOR = "#EE4D2D", "#1F9FB4"
-TYPE_COLORS = {"Agency": "#7A5AF8", "Internal MCs": "#16A34A", "KOLs": "#F59E0B"}
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.metadata.readonly",
-]
+SHEET_IDS = {
+    "shopee": "1RpP3HY6yTYnFqxFpF0NhwBRa70hCbynroZddm17dLIo",
+    "tiktok": "1yJU84We3_yzPScbhKMv3pjcaiuv8IzWhHlgcD3Z-jO4",
+    "perf": "1b0olOO85X6zsK2WCW1XeV2XhC5tq8IJmZNLZpUWiuEw",
+}
+REFRESH_MINUTES = 5          # how often the app re-reads the sheets
+SHOPEE_COLOR = "#EE4D2D"
+TIKTOK_COLOR = "#1F9FB4"
+TYPE_COLORS = {"Agency": "#6C5CE7", "Internal MCs": "#00A86B", "KOLs": "#F5A623"}
+TYPES = ["Agency", "Internal MCs", "KOLs"]
 
 st.set_page_config(page_title="Supersports Live Dashboard", page_icon="📺", layout="wide")
 
 # ----------------------------------------------------------------------------
-# Google Sheets access
-# ----------------------------------------------------------------------------
-@st.cache_resource
-def gclient() -> gspread.Client:
-    creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=SCOPES)
-    return gspread.authorize(creds)
-
-
-@st.cache_data(ttl=CHECK_EVERY_SECONDS, show_spinner=False)
-def sheet_versions() -> tuple:
-    """Last-edit time of each spreadsheet. A change here makes the data below reload."""
-    out = []
-    for fid in (SHOPEE_ID, TT_SUPERSPORTS_ID, TT_PERFORMANCE_ID):
-        try:
-            out.append(gclient().open_by_key(fid).get_lastUpdateTime())
-        except Exception:
-            out.append(int(time.time() // (FALLBACK_RELOAD_MINUTES * 60)))
-    return tuple(out)
-
-
-def batch_values(file_id: str, titles: list[str]) -> dict[str, list[list[str]]]:
-    """Read several tabs of one spreadsheet in a single API call (values as shown in the sheet)."""
-    sh = gclient().open_by_key(file_id)
-    ranges = [f"'{t}'" for t in titles]
-    res = sh.values_batch_get(ranges, params={"valueRenderOption": "FORMATTED_VALUE"})
-    out = {}
-    for t, vr in zip(titles, res.get("valueRanges", [])):
-        out[t] = vr.get("values", [])
-    return out
-
-
-# ----------------------------------------------------------------------------
 # Parsing helpers
 # ----------------------------------------------------------------------------
-MON = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
 
 
-def num(s) -> float:
+def num(s):
     s = str(s or "").replace(",", "").replace("฿", "").strip()
     try:
         return float(s)
@@ -96,28 +50,37 @@ def num(s) -> float:
         return 0.0
 
 
-def hms_to_min(s) -> float:
-    m = re.match(r"^(\d+):(\d+)(?::(\d+))?$", str(s or "").strip())
-    return int(m[1]) * 60 + int(m[2]) + int(m[3] or 0) / 60 if m else 0.0
+def hms_to_min(s):
+    """'2:00:21' or '18:00' -> minutes."""
+    m = re.match(r"^\s*(\d+):(\d+)(?::(\d+))?\s*$", str(s or ""))
+    if not m:
+        return 0.0
+    return int(m[1]) * 60 + int(m[2]) + int(m[3] or 0) / 60
 
 
 def clock_to_min(s):
-    m = re.match(r"^(\d+)(?::(\d+))?\s*(AM|PM)$", str(s or "").strip(), re.I)
-    if not m:
-        return None
-    return (int(m[1]) % 12 + (12 if m[3].upper() == "PM" else 0)) * 60 + int(m[2] or 0)
+    """'6:49 PM' / '2PM' / '18:30' -> minutes after midnight (or None)."""
+    s = str(s or "").strip()
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?(?::\d{2})?\s*(AM|PM)$", s, re.I)
+    if m:
+        h = int(m[1]) % 12 + (12 if m[3].upper() == "PM" else 0)
+        return h * 60 + int(m[2] or 0)
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", s)
+    if m:
+        return int(m[1]) * 60 + int(m[2])
+    return None
 
 
-def clock(s) -> str:
+def fmt_clock(s):
     v = clock_to_min(s)
     return "" if v is None else f"{v // 60:02d}:{v % 60:02d}"
 
 
-def to_aloshop(s: str) -> str:
-    return re.sub("nsq", "Aloshop", s or "", flags=re.I)
+def clean(s):
+    return re.sub("nsq", "Aloshop", str(s or "").strip(), flags=re.I)
 
 
-def type_of(operate: str) -> str:
+def type_of(operate):
     o = operate.lower()
     if "agency" in o or "aloshop" in o:
         return "Agency"
@@ -126,287 +89,310 @@ def type_of(operate: str) -> str:
     return "Internal MCs"
 
 
-def cell(row, i):
-    return row[i].strip() if i is not None and i < len(row) else ""
-
-
-def header_index(values, must: list[str], max_scan: int = 10):
-    """Find the header row that contains every name in `must`; return (row_no, {name: col})."""
-    for r, row in enumerate(values[:max_scan]):
-        cells = [str(c).strip() for c in row]
+def find_header(rows, *must):
+    """Index of the first row that contains every name in `must`."""
+    for i, r in enumerate(rows[:50]):
+        cells = [str(c).strip() for c in r]
         if all(any(c == m or c.startswith(m) for c in cells) for m in must):
-            idx = {}
-            for i, c in enumerate(cells):
-                idx.setdefault(c, i)
-                idx[c + "#last"] = i
-            return r, idx
-    raise ValueError(f"Header with {must} not found")
+            return i
+    raise ValueError(f"Header row with {must} not found")
 
 
-def find_col(idx: dict, name: str, last=False, startswith=False):
-    if startswith:
-        hits = [v for k, v in idx.items() if k.startswith(name) and not k.endswith("#last")]
-        return (max(hits) if last else min(hits)) if hits else None
-    return idx.get(name + "#last") if last else idx.get(name)
+def col(header, name, exact=True):
+    cells = [str(c).strip() for c in header]
+    for i, c in enumerate(cells):
+        if (c == name) if exact else c.lower().startswith(name.lower()):
+            return i
+    raise ValueError(f"Column '{name}' not found")
 
 
-# ----------------------------------------------------------------------------
-# Source readers
-# ----------------------------------------------------------------------------
-SH_OPERATE = {"Agency(aloshop)": "Agency (Aloshop)"}
-SH_ACCOUNT = {"SSP Official": "Supersports"}
-TT_ACCOUNT = {"supersports": "Supersports", "supersportsstore": "Supersports",
-              "supersportsfootball": "Supersports Football", "supersportsmahachai": "Supersports Mahachai"}
+def cell(r, i):
+    return r[i] if i is not None and i < len(r) else ""
 
 
-def read_shopee(values):
-    hr, ix = header_index(values, ["Year", "Date", "Live Operate", "Live Account", "Actual Duration"])
-    c = lambda n, **k: find_col(ix, n, **k)
-    cy, cd, cop, cac = c("Year"), c("Date"), c("Live Operate"), c("Live Account")
-    cs, ce, cplan, cdur = c("Live Starts"), c("Live Ends"), c("Duration Plan"), c("Actual Duration")
-    cg = c("GMV", startswith=True)
-    sched, perf = [], []
-    for row in values[hr + 1:]:
-        y, d = cell(row, cy), cell(row, cd)
-        if not y.isdigit() or "-" not in d:
-            continue
-        day, mon = d.split("-")[:2]
+def parse_date(s, year=None):
+    s = str(s or "").strip()
+    for f in ("%d-%b-%Y", "%m/%d/%Y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
-            date = dt.date(int(y), MON[mon[:3].lower()], int(day))
-        except (KeyError, ValueError):
-            continue
-        raw_op = cell(row, cop)
-        op = SH_OPERATE.get(raw_op, to_aloshop(raw_op))
-        ac = SH_ACCOUNT.get(cell(row, cac), cell(row, cac))
-        ty = type_of(raw_op)
-        sched.append(dict(date=date, channel="Shopee", account=ac, operate=op, type=ty,
-                          start=clock(cell(row, cs)), end=clock(cell(row, ce)), plan_hrs=hms_to_min(cell(row, cplan)) / 60))
-        g, du = num(cell(row, cg)), hms_to_min(cell(row, cdur))
-        if g > 0 or du > 0:
-            perf.append(dict(date=date, channel="Shopee", account=ac, operate=op, type=ty, gmv=g, hrs=du / 60, lives=1))
-    return sched, perf
-
-
-def tt_operate(mc: str) -> str:
-    return "Agency (Aloshop)" if mc.lower().startswith("agency") else to_aloshop(mc)
-
-
-def read_tt_calendar(values):
-    hr, ix = header_index(values, ["Date", "Live Account", "MC", "Live Start", "Live End", "Duration"])
-    c = lambda n, **k: find_col(ix, n, **k)
-    cd, cac, cmc, cs, ce, cdu = c("Date"), c("Live Account"), c("MC"), c("Live Start"), c("Live End"), c("Duration")
-    out = []
-    for row in values[hr + 1:]:
-        try:
-            date = dt.datetime.strptime(cell(row, cd), "%d-%b-%Y").date()
+            return dt.datetime.strptime(s, f).date()
         except ValueError:
-            continue
-        acc, mc = cell(row, cac), cell(row, cmc)
-        if not acc:
-            continue
-        if mc == "KOL" or acc not in TT_ACCOUNT:
-            ac, op, ty = "KOLs", acc, "KOLs"
-        else:
-            ac, op = TT_ACCOUNT[acc], tt_operate(mc)
-            ty = type_of(op)
-        s, e = clock_to_min(cell(row, cs)), clock_to_min(cell(row, ce))
-        plan = hms_to_min(cell(row, cdu))
-        if not plan and s is not None and e is not None:
-            plan = (e - s) % 1440
-        out.append(dict(date=date, channel="TikTok", account=ac, operate=op, type=ty,
-                        start=clock(cell(row, cs)), end=clock(cell(row, ce)), plan_hrs=plan / 60))
-    return out
-
-
-def read_tt_raw(values, account_override: str | None = None):
-    hr, ix = header_index(values, ["Nickname", "Revenue", "KOL Name", "Duration(minute)"])
-    c = lambda n, **k: find_col(ix, n, **k)
-    cn, cg, ck, cdu = c("Nickname"), c("Revenue", startswith=True), c("KOL Name"), c("Duration(minute)")
-    cd = c("Date", last=True)
-    out = []
-    for row in values[hr + 1:]:
-        nick = cell(row, cn)
-        if not nick:
-            continue
-        try:
-            date = dt.datetime.strptime(cell(row, cd), "%m/%d/%Y").date()
-        except ValueError:
-            continue
-        kn = cell(row, ck)
-        if account_override:
-            ac, op = account_override, ("Agency (Aloshop)" if re.search("agency|nsq|aloshop", kn, re.I) else (kn or "Other operators"))
-        elif nick == "supersportsstore":
-            ac, op = "Supersports", ("Agency (Aloshop)" if "agency" in kn.lower() else "Internal Live")
-        elif nick in ("supersportsfootball", "supersportsmahachai"):
-            ac, op = TT_ACCOUNT[nick], "Internal Live"
-        else:
-            ac, op = "KOLs", (kn if kn and kn != "Internal Live" else nick)
-        ty = "KOLs" if ac == "KOLs" else type_of(op)
-        out.append(dict(date=date, channel="TikTok", account=ac, operate=op, type=ty,
-                        gmv=num(cell(row, cg)), hrs=num(cell(row, cdu)) / 60, lives=1))
-    return out
-
-
-def read_perf_template(values):
-    hr, ix = header_index(values, ["Date", "Live Operate", "Live Starts", "Duration Plan"])
-    c = lambda n: find_col(ix, n)
-    cd, cop, cs, ce, cdu = c("Date"), c("Live Operate"), c("Live Starts"), c("formular Live Ends") or c("Live Ends"), c("Duration Plan")
-    out = []
-    for row in values[hr + 1:]:
-        try:
-            date = dt.datetime.strptime(cell(row, cd), "%d-%b-%Y").date()
-        except ValueError:
-            continue
-        raw = cell(row, cop)
-        if not raw:
-            continue
-        op = SH_OPERATE.get(raw, to_aloshop(raw))
-        s, e = clock_to_min(cell(row, cs)), clock_to_min(cell(row, ce))
-        plan = hms_to_min(cell(row, cdu)) or ((e - s) % 1440 if s is not None and e is not None else 0)
-        out.append(dict(date=date, channel="TikTok", account="Supersports Performance", operate=op, type=type_of(raw),
-                        start=clock(cell(row, cs)), end=clock(cell(row, ce)), plan_hrs=plan / 60))
-    return out
-
-
-PERF_TAB = re.compile(r"^(jan|feb|mar|apr|may|jun|june|jul|july|aug|sep|oct|nov|dec)(\d{2})?\s*perf$", re.I)
-
-
-def perf_tab_month(title: str):
-    m = PERF_TAB.match(title.strip())
-    if not m:
-        return None
-    year = 2000 + int(m[2]) if m[2] else 2025  # tabs without a year (Apr Perf ... Dec Perf) are 2025
-    return year, MON[m[1][:3].lower()]
-
-
-def read_perf_month(values, year: int, month: int):
-    """Daily Total Shop and Aloshop GMV/hours from one monthly Perf tab."""
-    # find the "Date" cell whose next row starts with a day like "1-July"
-    start = None
-    for r, row in enumerate(values):
-        for c0, v in enumerate(row[:3]):
-            if v.strip() == "Date" and any(re.match(r"^\d{1,2}-[A-Za-z]+$", cell(nx, c0)) for nx in values[r + 1:r + 4]):
-                start = (r, c0)
-                break
-        if start:
-            break
-    if not start:
-        return []
-    r0, c0 = start
-    days = [row for row in values[r0 + 1:] if re.match(r"^\d{1,2}-[A-Za-z]+$", cell(row, c0))]
-    g1 = c0 + 3  # Total Shop GMV
-    # Aloshop GMV column: the one that equals Total Shop GMV on Aloshop-only days and never exceeds it
-    best, best_hits = None, -1
-    width = max((len(r) for r in days), default=0)
-    for c in range(g1 + 5, width):
-        hits, ok = 0, True
-        for row in days:
-            a, t = num(cell(row, c)), num(cell(row, g1))
-            if a > t + 1:
-                ok = False
-                break
-            hits += int(t > 0 and abs(a - t) < 1)
-        if ok and hits > best_hits:
-            best, best_hits = c, hits
-    if best is None:
-        return []
-    h1, g2 = best - 1, best
-    h2 = g2 + (h1 - g1)
-    out = []
-    for row in days:
-        d = int(cell(row, c0).split("-")[0])
-        try:
-            date = dt.date(year, month, d)
-        except ValueError:
-            continue
-        gt, ht, ga, ha = num(cell(row, g1)), num(cell(row, h1)), num(cell(row, g2)), num(cell(row, h2))
-        if ga or ha:
-            out.append(dict(date=date, channel="TikTok", account="Supersports Performance", operate="Agency (Aloshop)",
-                            type="Agency", gmv=ga, hrs=ha, lives=None))
-        if (gt - ga) or (ht - ha):
-            out.append(dict(date=date, channel="TikTok", account="Supersports Performance", operate="Other operators",
-                            type="Internal MCs", gmv=gt - ga, hrs=ht - ha, lives=None))
-    return out
-
-
-@st.cache_data(ttl=24 * 3600, show_spinner="Loading the latest data from Google Sheets…")
-def load_all(versions: tuple):
-    notes = []
-    # Shopee
-    shp = batch_values(SHOPEE_ID, [SHOPEE_SHEET])[SHOPEE_SHEET]
-    sched, perf = read_shopee(shp)
-    # TikTok Supersports + KOLs
-    tt = batch_values(TT_SUPERSPORTS_ID, [TT_CALENDAR_SHEET, TT_RAW_SHEET])
-    sched += read_tt_calendar(tt[TT_CALENDAR_SHEET])
-    perf += read_tt_raw(tt[TT_RAW_SHEET])
-    # TikTok Supersports Performance
-    sh = gclient().open_by_key(TT_PERFORMANCE_ID)
-    titles = [w.title for w in sh.worksheets()]
-    tabs = [TT_PERF_TEMPLATE_SHEET] if TT_PERF_TEMPLATE_SHEET in titles else []
-    has_raw = TT_PERF_RAW_SHEET in titles
-    perf_tabs = [t for t in titles if perf_tab_month(t)]
-    if has_raw:
-        tabs.append(TT_PERF_RAW_SHEET)
-    else:
-        tabs += perf_tabs
-    pv = batch_values(TT_PERFORMANCE_ID, tabs) if tabs else {}
-    if TT_PERF_TEMPLATE_SHEET in pv:
-        sched += read_perf_template(pv[TT_PERF_TEMPLATE_SHEET])
-    if has_raw:
-        perf += read_tt_raw(pv[TT_PERF_RAW_SHEET], account_override="Supersports Performance")
-    else:
-        notes.append("Supersports Performance has no 'Live Raw Data' tab, so its results come from the monthly Perf tabs "
-                     "(Aloshop = Agency, the rest of the account = Internal MCs 'Other operators').")
-        for t in perf_tabs:
-            y, m = perf_tab_month(t)
-            perf += read_perf_month(pv[t], y, m)
-    s = pd.DataFrame(sched)
-    p = pd.DataFrame(perf)
-    s["date"] = pd.to_datetime(s["date"])
-    p["date"] = pd.to_datetime(p["date"])
-    return s, p, notes, dt.datetime.now(TZ)
-
-
-# ----------------------------------------------------------------------------
-# Periods and comparisons
-# ----------------------------------------------------------------------------
-def month_range(y, m):
-    first = dt.date(y + (m - 1) // 12, (m - 1) % 12 + 1, 1)
-    nxt = dt.date(first.year + first.month // 12, first.month % 12 + 1, 1)
-    return first, nxt - dt.timedelta(days=1)
-
-
-def preset_range(name: str):
-    t = dt.datetime.now(TZ).date()
-    q = (t.month - 1) // 3
-    if name == "This month":
-        return month_range(t.year, t.month)
-    if name == "Last month":
-        return month_range(t.year, t.month - 1)
-    if name == "Next month":
-        return month_range(t.year, t.month + 1)
-    if name == "This quarter":
-        return month_range(t.year, q * 3 + 1)[0], month_range(t.year, q * 3 + 3)[1]
-    if name == "Last quarter":
-        return month_range(t.year, q * 3 - 2)[0], month_range(t.year, q * 3)[1]
-    if name == "This year":
-        return dt.date(t.year, 1, 1), dt.date(t.year, 12, 31)
-    if name == "Last year":
-        return dt.date(t.year - 1, 1, 1), dt.date(t.year - 1, 12, 31)
+            pass
+    m = re.match(r"^(\d{1,2})-([A-Za-z]+)$", s)          # '2-Jan' + year column
+    if m and year:
+        return dt.date(int(year), MONTHS[m[2][:3].lower()], int(m[1]))
     return None
 
 
-def shift_months(d: dt.date, n: int, to_end=False) -> dt.date:
-    first, last = month_range(d.year, d.month + n)
-    return last if to_end else min(first.replace(day=d.day) if d.day <= last.day else last, last)
+# ----------------------------------------------------------------------------
+# Builders: raw sheet values -> tidy tables
+# ----------------------------------------------------------------------------
+SHOPEE_OPERATE = {"agency(aloshop)": "Agency (Aloshop)"}
+SHOPEE_ACCOUNT = {"SSP Official": "Supersports", "SSP Livestream": "SSP Livestream"}
+TT_OWN = {"supersports": "Supersports", "supersportsstore": "Supersports",
+          "supersportsfootball": "Supersports Football", "supersportsmahachai": "Supersports Mahachai"}
 
 
-def is_month_end(d: dt.date) -> bool:
-    return (d + dt.timedelta(days=1)).day == 1
+def tt_operate(mc):
+    mc = clean(mc)
+    return "Agency (Aloshop)" if mc.lower().startswith("agency") else mc
+
+
+def build_shopee(rows):
+    h = find_header(rows, "Live Operate", "Live Account", "Duration Plan")
+    hd = rows[h]
+    c = {k: col(hd, k) for k in ["Year", "Date", "Live Operate", "Live Account", "Live Starts",
+                                  "Live Ends", "Duration Plan", "Actual Duration"]}
+    c["GMV"] = col(hd, "GMV", exact=False)
+    sched, perf = [], []
+    for r in rows[h + 1:]:
+        d = parse_date(cell(r, c["Date"]), cell(r, c["Year"]))
+        op_raw = cell(r, c["Live Operate"]).strip()
+        if not d or not op_raw:
+            continue
+        op = SHOPEE_OPERATE.get(op_raw.lower(), clean(op_raw))
+        ac = SHOPEE_ACCOUNT.get(cell(r, c["Live Account"]).strip(), clean(cell(r, c["Live Account"])))
+        ty = type_of(op)
+        base = dict(date=d, channel="Shopee", account=ac, operate=op, type=ty)
+        sched.append({**base, "start": fmt_clock(cell(r, c["Live Starts"])), "end": fmt_clock(cell(r, c["Live Ends"])),
+                      "plan_hrs": hms_to_min(cell(r, c["Duration Plan"])) / 60})
+        gmv, dur = num(cell(r, c["GMV"])), hms_to_min(cell(r, c["Actual Duration"]))
+        if gmv > 0 or dur > 0:
+            perf.append({**base, "gmv": gmv, "hrs": dur / 60})
+    return sched, perf
+
+
+def build_tiktok_calendar(rows):
+    h = find_header(rows, "Live Account", "MC", "Live Start")
+    hd = rows[h]
+    c = {k: col(hd, k) for k in ["Date", "Live Account", "MC", "Live Start", "Live End", "Duration"]}
+    out = []
+    for r in rows[h + 1:]:
+        d = parse_date(cell(r, c["Date"]))
+        acc = cell(r, c["Live Account"]).strip()
+        if not d or not acc:
+            continue
+        mc = cell(r, c["MC"]).strip()
+        if mc.upper() == "KOL" or acc.lower() not in TT_OWN:
+            ac, op, ty = "KOLs", acc, "KOLs"
+        else:
+            ac, op = TT_OWN[acc.lower()], tt_operate(mc)
+            ty = type_of(op)
+        s, e = clock_to_min(cell(r, c["Live Start"])), clock_to_min(cell(r, c["Live End"]))
+        pm = hms_to_min(cell(r, c["Duration"]))
+        if not pm and s is not None and e is not None:
+            pm = (e - s) % 1440
+        out.append(dict(date=d, channel="TikTok", account=ac, operate=op, type=ty,
+                        start=fmt_clock(cell(r, c["Live Start"])), end=fmt_clock(cell(r, c["Live End"])),
+                        plan_hrs=pm / 60))
+    return out
+
+
+def build_tiktok_raw(rows, account_override=None):
+    h = find_header(rows, "Creator ID", "Nickname")
+    hd = rows[h]
+    c = {"nick": col(hd, "Nickname"), "rev": col(hd, "Revenue", exact=False),
+         "kol": col(hd, "KOL Name"), "dur": col(hd, "Duration(minute)"), "date": col(hd, "Date")}
+    out = []
+    for r in rows[h + 1:]:
+        nick, d = cell(r, c["nick"]).strip(), parse_date(cell(r, c["date"]))
+        if not nick or not d:
+            continue
+        kn = clean(cell(r, c["kol"]))
+        if account_override:
+            ac, op = account_override, tt_operate(kn) if kn else "Other operators"
+        elif nick.lower() == "supersportsstore":
+            ac, op = "Supersports", ("Agency (Aloshop)" if "agency" in kn.lower() else "Internal Live")
+        elif nick.lower() in TT_OWN:
+            ac, op = TT_OWN[nick.lower()], "Internal Live"
+        else:
+            ac, op = "KOLs", (kn if kn and kn != "Internal Live" else nick)
+        ty = "KOLs" if ac == "KOLs" else type_of(op)
+        out.append(dict(date=d, channel="TikTok", account=ac, operate=op, type=ty,
+                        gmv=num(cell(r, c["rev"])), hrs=num(cell(r, c["dur"])) / 60))
+    return out
+
+
+def build_perf_template(rows):
+    h = find_header(rows, "Date", "Live Operate", "Live Starts")
+    hd = rows[h]
+    c = {"date": col(hd, "Date"), "op": col(hd, "Live Operate"), "s": col(hd, "Live Starts")}
+    try:
+        c["e"] = next(i for i, x in enumerate(hd) if "live ends" in str(x).lower())
+    except StopIteration:
+        c["e"] = None
+    try:
+        c["dur"] = col(hd, "Duration Plan")
+    except ValueError:
+        c["dur"] = None
+    out = []
+    for r in rows[h + 1:]:
+        d = parse_date(cell(r, c["date"]))
+        op_raw = cell(r, c["op"]).strip()
+        if not d or not op_raw:
+            continue
+        op = "Agency (Aloshop)" if "aloshop" in op_raw.lower() or "agency" in op_raw.lower() else clean(op_raw)
+        s, e = clock_to_min(cell(r, c["s"])), clock_to_min(cell(r, c["e"]))
+        pm = hms_to_min(cell(r, c["dur"])) if c["dur"] is not None else 0
+        if not pm and s is not None and e is not None:
+            pm = (e - s) % 1440 or 1440
+        out.append(dict(date=d, channel="TikTok", account="Supersports Performance", operate=op, type=type_of(op),
+                        start=fmt_clock(cell(r, c["s"])), end=fmt_clock(cell(r, c["e"])), plan_hrs=pm / 60))
+    return out
+
+
+PERF_SHEET_RE = re.compile(r"^([A-Za-z]{3,9})\s*'?(\d{2})?\s+Perf$", re.I)
+
+
+def perf_sheet_month(title, default_year=2025):
+    m = PERF_SHEET_RE.match(title.strip())
+    if not m or m[1][:3].lower() not in MONTHS:
+        return None
+    return (2000 + int(m[2])) if m[2] else default_year, MONTHS[m[1][:3].lower()]
+
+
+def _match_col(row, target, start=0):
+    for i in range(start, len(row)):
+        tol = 3 if target >= 1000 else 0.01      # GMV may differ by a few baht of rounding; hours must match
+        if target and abs(num(row[i]) - target) <= tol:
+            return i
+    return None
+
+
+def build_perf_monthly(title, rows):
+    """A '<Mon>[YY] Perf' sheet: daily Total Shop vs Aloshop GMV and hours (Date block)."""
+    ym = perf_sheet_month(title)
+    if not ym:
+        return []
+    year, month = ym
+    di = next((i for i, r in enumerate(rows) if r and str(r[0]).strip() == "Date"), None)
+    if di is None:
+        return []
+    # The two summary blocks each end in a "Total" row: [label, hours, GMV, ...]
+    totals = [r for r in rows[:di] if r and str(r[0]).strip() == "Total"]
+    cols = (3, 15, 16, 28)                                       # default layout
+    if len(totals) >= 2 and di >= 1:
+        tr = rows[di - 1]                                        # column totals of the Date block
+        g1 = _match_col(tr, num(totals[0][2]))
+        h1 = _match_col(tr, num(totals[0][1]), (g1 or 0) + 1)
+        g2 = _match_col(tr, num(totals[1][2]), (h1 or 0) + 1)
+        h2 = _match_col(tr, num(totals[1][1]), (g2 or 0) + 1)
+        if None not in (g1, h1, g2, h2):
+            cols = (g1, h1, g2, h2)
+    gi, hi, ai, ahi = cols
+    out = []
+    for r in rows[di + 1:]:
+        m = re.match(r"^(\d{1,2})-[A-Za-z]+", str(cell(r, 0)).strip())
+        if not m:
+            continue
+        day = int(m[1])
+        if day > monthrange(year, month)[1]:
+            continue
+        d = dt.date(year, month, day)
+        g, h, a, ah = num(cell(r, gi)), num(cell(r, hi)), num(cell(r, ai)), num(cell(r, ahi))
+        base = dict(date=d, channel="TikTok", account="Supersports Performance")
+        if a or ah:
+            out.append({**base, "operate": "Agency (Aloshop)", "type": "Agency", "gmv": a, "hrs": ah})
+        if (g - a) > 0 or (h - ah) > 0:
+            out.append({**base, "operate": "Other operators", "type": "Internal MCs",
+                        "gmv": max(g - a, 0), "hrs": max(h - ah, 0)})
+    return out
+
+
+def build_all(shopee_rows, cal_rows, raw_rows, tpl_rows, perf_sheets, perf_raw_rows=None):
+    sched, perf = build_shopee(shopee_rows)
+    sched += build_tiktok_calendar(cal_rows)
+    perf += build_tiktok_raw(raw_rows)
+    if tpl_rows:
+        sched += build_perf_template(tpl_rows)
+    if perf_raw_rows:                       # a "Live Raw Data" sheet in the Performance file wins
+        perf += build_tiktok_raw(perf_raw_rows, account_override="Supersports Performance")
+    else:
+        for title, rows in perf_sheets.items():
+            perf += build_perf_monthly(title, rows)
+    S = pd.DataFrame(sched, columns=["date", "channel", "account", "operate", "type", "start", "end", "plan_hrs"])
+    P = pd.DataFrame(perf, columns=["date", "channel", "account", "operate", "type", "gmv", "hrs"])
+    for df in (S, P):
+        df["date"] = pd.to_datetime(df["date"])
+    return S, P
+
+
+# ----------------------------------------------------------------------------
+# Google Sheets loading (cached; re-read every REFRESH_MINUTES)
+# ----------------------------------------------------------------------------
+@st.cache_resource
+def gs_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    return gspread.authorize(creds)
+
+
+def _values(book, title):
+    return book.worksheet(title).get_all_values()
+
+
+@st.cache_data(ttl=REFRESH_MINUTES * 60, show_spinner="Reading Google Sheets…")
+def load_data():
+    gc = gs_client()
+    shopee = gc.open_by_key(SHEET_IDS["shopee"])
+    tiktok = gc.open_by_key(SHEET_IDS["tiktok"])
+    pbook = gc.open_by_key(SHEET_IDS["perf"])
+
+    titles = [ws.title for ws in pbook.worksheets()]
+    perf_titles = [t for t in titles if perf_sheet_month(t)]
+    perf_sheets = {}
+    if perf_titles:                                   # one API call for all monthly sheets
+        res = pbook.values_batch_get([f"'{t}'" for t in perf_titles])
+        for t, vr in zip(perf_titles, res.get("valueRanges", [])):
+            perf_sheets[t] = vr.get("values", [])
+
+    S, P = build_all(
+        shopee_rows=_values(shopee, "Report - By Live"),
+        cal_rows=_values(tiktok, "Daily Live Calendar"),
+        raw_rows=_values(tiktok, "Live Raw Data"),
+        tpl_rows=_values(pbook, "Live Template(NEW)") if "Live Template(NEW)" in titles else [],
+        perf_sheets=perf_sheets,
+        perf_raw_rows=_values(pbook, "Live Raw Data") if "Live Raw Data" in titles else None,
+    )
+    return S, P, dt.datetime.now()
+
+
+# ----------------------------------------------------------------------------
+# Period helpers
+# ----------------------------------------------------------------------------
+def month_end(d):
+    return d.replace(day=monthrange(d.year, d.month)[1])
+
+
+def add_months(d, n, to_end=False):
+    y, m = divmod(d.month - 1 + n, 12)
+    y, m = d.year + y, m + 1
+    last = monthrange(y, m)[1]
+    return dt.date(y, m, last if to_end else min(d.day, last))
 
 
 def shift_window(s, e, n):
-    return shift_months(s, n), shift_months(e, n, to_end=is_month_end(e))
+    return add_months(s, n), add_months(e, n, to_end=(e == month_end(e)))
+
+
+def preset_range(p, today):
+    first = today.replace(day=1)
+    q0 = dt.date(today.year, 3 * ((today.month - 1) // 3) + 1, 1)
+    return {
+        "This month": (first, month_end(first)),
+        "Last month": (add_months(first, -1), month_end(add_months(first, -1))),
+        "Next month": (add_months(first, 1), month_end(add_months(first, 1))),
+        "This quarter": (q0, month_end(add_months(q0, 2))),
+        "Last quarter": (add_months(q0, -3), month_end(add_months(q0, -1))),
+        "This year": (dt.date(today.year, 1, 1), dt.date(today.year, 12, 31)),
+        "Last year": (dt.date(today.year - 1, 1, 1), dt.date(today.year - 1, 12, 31)),
+    }[p]
+
+
+def fmt_range(s, e):
+    return f"{s:%b %-d} – {e:%b %-d, %Y}" if s.year == e.year else f"{s:%b %-d, %Y} – {e:%b %-d, %Y}"
 
 
 def pct(a, b):
@@ -418,277 +404,394 @@ def fmt_pct(v):
 
 
 def thb(v):
-    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
         if abs(v) >= div:
-            return f"฿{v / div:,.2f}{unit}"
+            return f"฿{v / div:,.2f}{suf}"
     return f"฿{v:,.0f}"
 
 
-def color_pct(v):
-    if isinstance(v, str) and v.startswith("+"):
-        return "color: #15803d"
-    if isinstance(v, str) and v.startswith("-"):
-        return "color: #b91c1c"
-    return "color: #888"
+def between(df, s, e):
+    return df[(df["date"] >= pd.Timestamp(s)) & (df["date"] <= pd.Timestamp(e))]
 
 
 # ----------------------------------------------------------------------------
-# Page
+# Table builders
 # ----------------------------------------------------------------------------
-if st_autorefresh:
-    st_autorefresh(interval=CHECK_EVERY_SECONDS * 1000, key="auto_check")
+SCHED_ROWS = [  # (label, level, filter)
+    ("Total 2 channels", 0, lambda d: d),
+    ("Shopee", 1, lambda d: d[d.channel == "Shopee"]),
+    ("Supersports account", 2, lambda d: d[(d.channel == "Shopee") & (d.account == "Supersports")]),
+    ("Internal MCs", 3, lambda d: d[(d.channel == "Shopee") & (d.account == "Supersports") & (d.type == "Internal MCs")]),
+    ("Agency (Aloshop)", 3, lambda d: d[(d.channel == "Shopee") & (d.account == "Supersports") & (d.type == "Agency")]),
+    ("KOLs (Shopee KOL)", 3, lambda d: d[(d.channel == "Shopee") & (d.account == "Supersports") & (d.type == "KOLs")]),
+    ("SSP Livestream account (Agency)", 2, lambda d: d[(d.channel == "Shopee") & (d.account == "SSP Livestream")]),
+    ("TikTok", 1, lambda d: d[d.channel == "TikTok"]),
+    ("Supersports account", 2, lambda d: d[(d.channel == "TikTok") & (d.account == "Supersports")]),
+    ("Internal MCs", 3, lambda d: d[(d.channel == "TikTok") & (d.account == "Supersports") & (d.type == "Internal MCs")]),
+    ("Agency (Aloshop)", 3, lambda d: d[(d.channel == "TikTok") & (d.account == "Supersports") & (d.type == "Agency")]),
+    ("Supersports Performance account", 2, lambda d: d[(d.channel == "TikTok") & (d.account == "Supersports Performance")]),
+    ("KOLs accounts", 2, lambda d: d[(d.channel == "TikTok") & (d.account == "KOLs")]),
+    ("Other own accounts (Football, Mahachai)", 2,
+     lambda d: d[(d.channel == "TikTok") & d.account.isin(["Supersports Football", "Supersports Mahachai"])]),
+]
 
-st.markdown("""
-<style>
-.block-container {padding-top: 1.6rem;}
-div[data-testid="stMetricValue"] {font-size: 1.6rem;}
-</style>""", unsafe_allow_html=True)
+PERF_ROWS = [
+    ("Total 2 channels", 0, lambda d: d),
+    ("Shopee", 1, lambda d: d[d.channel == "Shopee"]),
+    ("Internal MCs", 2, lambda d: d[(d.channel == "Shopee") & (d.type == "Internal MCs")]),
+    ("Agency", 2, lambda d: d[(d.channel == "Shopee") & (d.type == "Agency")]),
+    ("KOLs", 2, lambda d: d[(d.channel == "Shopee") & (d.type == "KOLs")]),
+    ("TikTok", 1, lambda d: d[d.channel == "TikTok"]),
+    ("Agency", 2, lambda d: d[(d.channel == "TikTok") & (d.type == "Agency")]),
+    ("Internal MCs", 2, lambda d: d[(d.channel == "TikTok") & (d.type == "Internal MCs")]),
+    ("KOLs", 2, lambda d: d[(d.channel == "TikTok") & (d.type == "KOLs")]),
+]
+INDENT = {0: "", 1: "", 2: " ", 3: "  "}
 
+
+def schedule_table(d):
+    total_hrs = d.plan_hrs.sum()
+    out = []
+    for label, lvl, f in SCHED_ROWS:
+        x = f(d)
+        n, h = len(x), x.plan_hrs.sum()
+        out.append({"Channel / account / live operate": INDENT[lvl] + label,
+                    "Lives": n, "Planned hrs": round(h, 1), "Live days": x.date.nunique(),
+                    "Avg hrs per live": round(h / n, 1) if n else None,
+                    "Share of hrs": f"{h / total_hrs:.1%}" if total_hrs and n else "–", "_lvl": lvl})
+    return pd.DataFrame(out)
+
+
+def perf_table(cur, lm, ly, field, label):
+    tot = cur[field].sum()
+    out = []
+    for name, lvl, f in PERF_ROWS:
+        v, a, b = f(cur)[field].sum(), f(lm)[field].sum(), f(ly)[field].sum()
+        r = 0 if field == "gmv" else 1
+        out.append({"Live operate": INDENT[lvl] + name, label: round(v, r),
+                    "Share": f"{v / tot:.1%}" if tot and v else "–",
+                    "Last month": round(a, r), "%CHG MoM": fmt_pct(pct(v, a)),
+                    "Last year": round(b, r), "%CHG YoY": fmt_pct(pct(v, b)), "_lvl": lvl})
+    return pd.DataFrame(out)
+
+
+def style_table(df, num_cols, decimals=0):
+    lvl = df["_lvl"]
+    show = df.drop(columns="_lvl")
+
+    def row_style(r):
+        l = lvl.loc[r.name]
+        if l == 0:
+            return ["font-weight:700; background-color:rgba(127,127,127,.12)"] * len(r)
+        if l == 1:
+            return ["font-weight:700"] * len(r)
+        return [""] * len(r)
+
+    def chg_color(v):
+        if isinstance(v, str) and v.startswith("+"):
+            return "color:#1a9e5a"
+        if isinstance(v, str) and v.startswith("-"):
+            return "color:#d64545"
+        return ""
+
+    sty = show.style.apply(row_style, axis=1).format(
+        {c: (f"{{:,.{decimals}f}}" if c not in ("Lives", "Live days") else "{:,.0f}") for c in num_cols},
+        na_rep="–")
+    chg_cols = [c for c in show.columns if c.startswith("%CHG")]
+    if chg_cols:
+        sty = sty.map(chg_color, subset=chg_cols)
+    return sty
+
+
+def stacked_bars(df, value_col, s, e, split, yfmt, title_unit):
+    days = (e - s).days + 1
+    freq, label = ("MS", "month") if days > 120 else ("W-MON", "week") if days > 45 else ("D", "day")
+    d = df.copy()
+    if freq == "MS":
+        d["bucket"] = d.date.dt.to_period("M").dt.start_time
+    elif freq == "W-MON":
+        d["bucket"] = d.date - pd.to_timedelta(d.date.dt.weekday, unit="D")
+    else:
+        d["bucket"] = d.date
+    keys = ["Shopee", "TikTok"] if split == "Channel" else TYPES
+    colors = {"Shopee": SHOPEE_COLOR, "TikTok": TIKTOK_COLOR, **TYPE_COLORS}
+    by = "channel" if split == "Channel" else "type"
+    piv = d.pivot_table(index="bucket", columns=by, values=value_col, aggfunc="sum", fill_value=0)
+    fig = go.Figure()
+    for k in keys:
+        if k in piv.columns:
+            fig.add_bar(x=piv.index, y=piv[k], name=k, marker_color=colors[k],
+                        hovertemplate=f"%{{x|%b %-d, %Y}}<br>{k}: %{{y:{yfmt}}}{title_unit}<extra></extra>")
+    fig.update_layout(barmode="stack", height=320, margin=dict(l=10, r=10, t=10, b=10),
+                      legend=dict(orientation="h", y=1.1), bargap=0.2)
+    fig.update_yaxes(tickformat=yfmt, gridcolor="rgba(127,127,127,.2)")
+    return fig, label
+
+
+def calendar_html(d, s, e, max_months=3):
+    by = d.groupby(d.date.dt.date).agg(
+        sh=("channel", lambda x: (x == "Shopee").sum()), tt=("channel", lambda x: (x == "TikTok").sum()),
+        h=("plan_hrs", "sum"))
+    html = ["<div style='display:flex;flex-direction:column;gap:14px;font-size:12px'>"]
+    m = s.replace(day=1)
+    shown = 0
+    while m <= e and shown < max_months:
+        html.append(f"<div><div style='font-weight:600;margin-bottom:4px'>{m:%B %Y}</div>"
+                    "<div style='display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:3px'>")
+        html += [f"<div style='text-align:center;opacity:.6;font-size:11px'>{w}</div>"
+                 for w in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]]
+        html += ["<div></div>"] * m.weekday()
+        for day in range(1, monthrange(m.year, m.month)[1] + 1):
+            dd = m.replace(day=day)
+            out = dd < s or dd > e
+            o = by.loc[dd] if dd in by.index else None
+            body = f"<span style='opacity:.6'>{day}</span>"
+            if o is not None:
+                if o.sh:
+                    body += f"<span><b style='color:{SHOPEE_COLOR}'>■</b> {int(o.sh)} Shopee</span>"
+                if o.tt:
+                    body += f"<span><b style='color:{TIKTOK_COLOR}'>■</b> {int(o.tt)} TikTok</span>"
+                body += f"<span style='margin-top:auto;opacity:.6'>{o.h:,.1f}h</span>"
+            html.append("<div style='border:1px solid rgba(127,127,127,.3);border-radius:4px;padding:3px 4px;"
+                        f"min-height:56px;display:flex;flex-direction:column;gap:1px;opacity:{.35 if out else 1};"
+                        f"{'border-style:dashed;' if o is None else ''}'>{body}</div>")
+        html.append("</div></div>")
+        m = add_months(m, 1)
+        shown += 1
+    if m <= e:
+        html.append("<div style='opacity:.6'>The calendar shows the first 3 months of the period.</div>")
+    html.append("</div>")
+    return "".join(html)
+
+
+# ----------------------------------------------------------------------------
+# App
+# ----------------------------------------------------------------------------
 st.title("Supersports Live Schedule & Performance")
 
 try:
-    sched_all, perf_all, notes, loaded_at = load_all(sheet_versions())
-except Exception as exc:  # show a readable error instead of a stack trace
-    st.error(f"Could not read the Google Sheets: {exc}. Check that each sheet is shared with the service account "
-             f"in secrets.toml and that the tab names are unchanged.")
+    S_all, P_all, loaded_at = load_data()
+except Exception as exc:  # show a readable message instead of a stack trace
+    st.error(f"Couldn't read the Google Sheets: {exc}. Check that each sheet is shared with the "
+             "service account email in your secrets.")
     st.stop()
 
-# ---- Filters
-f1, f2, f3, f4, f5 = st.columns([1.2, 1, 1, 1.2, 1])
-presets = ["This month", "Last month", "Next month", "This quarter", "Last quarter", "This year", "Last year", "Custom dates"]
-preset = f1.selectbox("Period", presets, index=0)
-default = preset_range(preset) or preset_range("This month")
-if preset == "Custom dates":
-    rng = f2.date_input("From – To", value=default, format="YYYY-MM-DD")
-    start, end = (rng if isinstance(rng, (list, tuple)) and len(rng) == 2 else default)
-    f3.write("")
-else:
-    start, end = default
-    f2.metric("From", start.strftime("%b %d, %Y"))
-    f3.metric("To", end.strftime("%b %d, %Y"))
-channel = f4.selectbox("Channel", ["All (TikTok + Shopee)", "TikTok", "Shopee"])
-ttype = f5.selectbox("Type", ["All types", "Agency", "Internal MCs", "KOLs"])
-split = st.radio("Split charts by", ["Channel", "Type"], horizontal=True)
-
-c1, c2 = st.columns([4, 1])
-c1.caption(f"Data loaded {loaded_at:%b %d, %Y %H:%M} (Bangkok). The page checks for sheet edits every "
-           f"{CHECK_EVERY_SECONDS} seconds and reloads when a sheet changes.")
-if c2.button("Refresh now"):
-    st.cache_data.clear()
-    st.rerun()
-
-
-def keep(df: pd.DataFrame) -> pd.DataFrame:
-    m = pd.Series(True, index=df.index)
-    if channel != "All (TikTok + Shopee)":
-        m &= df["channel"] == channel
-    if ttype != "All types":
-        m &= df["type"] == ttype
-    return df[m]
-
-
-def window(df, s, e):
-    return keep(df[(df["date"] >= pd.Timestamp(s)) & (df["date"] <= pd.Timestamp(e))])
-
-
-ctx_label = f"{start:%b %d, %Y} – {end:%b %d, %Y} · {channel.split(' (')[0] if channel.startswith('All') else channel} · {ttype}"
-
-last_result = perf_all.loc[perf_all["gmv"] > 0, "date"].max().date()
-pe = min(end, last_result)
-cur_s, cur_e = start, pe
-lm_s, lm_e = shift_window(cur_s, cur_e, -1)
-ly_s, ly_e = shift_window(cur_s, cur_e, -12)
-no_results = pe < start
-
-S = window(sched_all, start, end)
-P = window(perf_all, cur_s, cur_e) if not no_results else perf_all.iloc[0:0]
-PLM = window(perf_all, lm_s, lm_e)
-PLY = window(perf_all, ly_s, ly_e)
-
-
-def bucket(df: pd.DataFrame, s, e) -> tuple[pd.DataFrame, str]:
-    days = (e - s).days + 1
-    unit = "month" if days > 120 else "week" if days > 45 else "day"
-    d = df.copy()
-    if unit == "month":
-        d["bucket"] = d["date"].dt.to_period("M").dt.start_time
-    elif unit == "week":
-        d["bucket"] = d["date"] - pd.to_timedelta(d["date"].dt.weekday, unit="D")
+# ---- Sidebar filters
+today = dt.date.today()
+with st.sidebar:
+    st.header("Filters")
+    preset = st.selectbox("Period", ["This month", "Last month", "Next month", "This quarter", "Last quarter",
+                                     "This year", "Last year", "Custom dates"])
+    if preset == "Custom dates":
+        ps, pe = preset_range("This month", today)
+        picked = st.date_input("From – To", (ps, pe))
+        start, end = (picked if isinstance(picked, (list, tuple)) and len(picked) == 2 else (ps, pe))
     else:
-        d["bucket"] = d["date"]
-    return d, unit
+        start, end = preset_range(preset, today)
+    channel = st.selectbox("Channel", ["All (TikTok + Shopee)", "TikTok", "Shopee"])
+    typ = st.selectbox("Type", ["All types"] + TYPES)
+    split = st.radio("Split charts by", ["Channel", "Type"], horizontal=True)
+    st.divider()
+    if st.button("Refresh data now", width="stretch"):
+        st.cache_data.clear()
+        st.rerun()
+    st.caption(f"Data read {loaded_at:%b %-d, %Y %H:%M}. Re-reads Google Sheets every {REFRESH_MINUTES} min.")
 
 
-def bar_chart(df, value, s, e, y_title, money=False):
-    d, unit = bucket(df, s, e)
-    key = "channel" if split == "Channel" else "type"
-    g = d.groupby(["bucket", key], as_index=False)[value].sum()
-    cmap = {"Shopee": SH_COLOR, "TikTok": TT_COLOR, **TYPE_COLORS}
-    fig = px.bar(g, x="bucket", y=value, color=key, color_discrete_map=cmap,
-                 labels={"bucket": unit.title(), value: y_title, key: ""})
-    fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), legend=dict(orientation="h", y=1.1), bargap=0.2)
-    fig.update_xaxes(range=[pd.Timestamp(s) - pd.Timedelta(days=0.6), pd.Timestamp(e) + pd.Timedelta(days=0.6)])
-    if money:
-        fig.update_yaxes(tickprefix="฿")
-    st.plotly_chart(fig, width="stretch")
-    return unit
+@st.fragment(run_every=f"{REFRESH_MINUTES}m")
+def dashboard(start, end, channel, typ, split):
+    S_all, P_all, loaded_at = load_data()          # cached; re-read after REFRESH_MINUTES
+
+    def keep(df):
+        if channel != "All (TikTok + Shopee)":
+            df = df[df.channel == channel]
+        if typ != "All types":
+            df = df[df.type == typ]
+        return df
+
+    S, P = keep(S_all), keep(P_all)
+    last = P_all.loc[P_all.gmv > 0, "date"].max()
+    last = last.date() if pd.notna(last) else end
+    cur_e = min(end, last)
+    empty = cur_e < start
+    lm_s, lm_e = shift_window(start, cur_e, -1)
+    ly_s, ly_e = shift_window(start, cur_e, -12)
+    filt = f"{channel if channel != 'All (TikTok + Shopee)' else 'TikTok + Shopee'} · {typ}"
+
+    sched = between(S, start, end)
+    cur = between(P, start, cur_e) if not empty else P.iloc[0:0]
+    lm, ly = between(P, lm_s, lm_e), between(P, ly_s, ly_e)
+
+    st.markdown(
+        f"**{fmt_range(start, end)}**: **{len(sched):,}** lives planned (**{sched.plan_hrs.sum():,.1f}** hrs). "
+        f"Results to **{last:%b %-d, %Y}**: GMV **{thb(cur.gmv.sum())}**, "
+        f"**{fmt_pct(pct(cur.gmv.sum(), lm.gmv.sum()))}** vs last month and "
+        f"**{fmt_pct(pct(cur.gmv.sum(), ly.gmv.sum()))}** vs last year.")
+
+    tab_a, tab_b = st.tabs(["A · Live Schedule", "B · Live Performance"])
+
+    # ============================ A: LIVE SCHEDULE ============================
+    with tab_a:
+        with st.container(border=True):
+            st.subheader("Live schedule summary")
+            st.caption(f"{fmt_range(start, end)} · {filt}")
+            c1, c2, c3, c4 = st.columns(4)
+            sh, tt = sched[sched.channel == "Shopee"], sched[sched.channel == "TikTok"]
+            tot_h = sched.plan_hrs.sum()
+            c1.metric("Total lives planned", f"{len(sched):,}",
+                      f"{tot_h:,.1f} hrs · {sched.date.nunique()} live days", delta_color="off")
+            c2.metric("Shopee", f"{len(sh):,}", f"{sh.plan_hrs.sum():,.1f} hrs planned", delta_color="off")
+            c3.metric("TikTok", f"{len(tt):,}", f"{tt.plan_hrs.sum():,.1f} hrs planned", delta_color="off")
+            shares = " · ".join(f"{sched[sched.type == t].plan_hrs.sum() / tot_h:.0%}" if tot_h else "–" for t in TYPES)
+            c4.metric("Agency · Internal MCs · KOLs", shares, "share of planned hours", delta_color="off")
+            st.dataframe(style_table(schedule_table(sched), ["Lives", "Planned hrs", "Live days", "Avg hrs per live"], 1),
+                         hide_index=True, width="stretch")
+
+        a1, a2 = st.columns(2)
+        with a1, st.container(border=True):
+            st.subheader("Live plan by channel")
+            fig, unit = stacked_bars(sched, "plan_hrs", start, end, split, ",.1f", " hrs")
+            st.caption(f"{fmt_range(start, end)} · planned live hours per {unit}")
+            st.plotly_chart(fig, width="stretch", key="sched_chart")
+        with a2, st.container(border=True):
+            st.subheader("Live calendar")
+            st.caption("Lives per day by channel, planned hours at the bottom of each day")
+            st.markdown(calendar_html(sched, start, end), unsafe_allow_html=True)
+
+        with st.container(border=True):
+            st.subheader("Schedule by live operate")
+            g = (sched.groupby(["operate", "type", "channel", "account"], as_index=False)
+                 .agg(Lives=("date", "size"), **{"Planned hrs": ("plan_hrs", "sum")})
+                 .sort_values("Planned hrs", ascending=False))
+            g["Share of hrs"] = (g["Planned hrs"] / tot_h).map("{:.1%}".format) if tot_h else "–"
+            g.columns = ["Live operate", "Type", "Channel", "Account", "Lives", "Planned hrs", "Share of hrs"]
+            st.dataframe(g.style.format({"Planned hrs": "{:,.1f}"}), hide_index=True, width="stretch")
+
+        with st.container(border=True):
+            st.subheader("Daily live plan")
+            q = st.text_input("Search date, operate or account", key="q")
+            lst = sched.sort_values(["date", "start"]).assign(
+                Date=lambda x: x.date.dt.strftime("%a %b %-d, %Y"),
+                Time=lambda x: x.start + "–" + x.end)
+            lst = lst[["Date", "Time", "channel", "account", "operate", "type", "plan_hrs"]]
+            lst.columns = ["Date", "Time", "Channel", "Account", "Live operate", "Type", "Planned hrs"]
+            if q:
+                lst = lst[lst.apply(lambda r: q.lower() in " ".join(map(str, r.values)).lower(), axis=1)]
+            st.dataframe(lst.style.format({"Planned hrs": "{:,.1f}"}), hide_index=True,
+                         width="stretch", height=420)
+
+    # ========================== B: LIVE PERFORMANCE ===========================
+    with tab_b:
+        cur_label = f"No results yet for {fmt_range(start, end)}" if empty else fmt_range(start, cur_e)
+        with st.container(border=True):
+            st.subheader("Live performance summary")
+            st.caption(f"{cur_label} · {filt}")
+            cols = st.columns(5)
+
+            def tile(c, label, a, b_lm, b_ly, fmt):
+                c.metric(label, fmt(a), f"MoM {fmt_pct(pct(a, b_lm))} · YoY {fmt_pct(pct(a, b_ly))}",
+                         delta_color="off")
+
+            for c, label, ch in [(cols[0], "GMV, 2 channels", None), (cols[1], "Shopee GMV", "Shopee"),
+                                 (cols[2], "TikTok GMV", "TikTok")]:
+                f = (lambda d: d) if ch is None else (lambda d, ch=ch: d[d.channel == ch])
+                tile(c, label, f(cur).gmv.sum(), f(lm).gmv.sum(), f(ly).gmv.sum(), thb)
+            tile(cols[3], "Live duration (hrs)", cur.hrs.sum(), lm.hrs.sum(), ly.hrs.sum(), lambda v: f"{v:,.1f}")
+            gph = lambda d: d.gmv.sum() / d.hrs.sum() if d.hrs.sum() else 0
+            tile(cols[4], "GMV per live hour", gph(cur), gph(lm), gph(ly), thb)
+            st.caption(f"Compared with the same days last month ({fmt_range(lm_s, lm_e)}) and last year "
+                       f"({fmt_range(ly_s, ly_e)}). The current period stops at the latest date with results.")
+
+        st.markdown("#### 1 · GMV")
+        b1, b2 = st.columns(2)
+        with b1, st.container(border=True):
+            st.subheader("GMV by date")
+            fig, unit = stacked_bars(cur, "gmv", start, cur_e, split, ",.0f", " THB")
+            st.caption(f"{cur_label} · GMV (THB) per {unit}")
+            st.plotly_chart(fig, width="stretch", key="gmv_chart")
+        with b2, st.container(border=True):
+            st.subheader("GMV by live operate")
+            st.caption(cur_label)
+            t = perf_table(cur, lm, ly, "gmv", "GMV (THB)")
+            st.dataframe(style_table(t, ["GMV (THB)", "Last month", "Last year"], 0), hide_index=True,
+                         width="stretch")
+
+        st.markdown("#### 2 · Duration")
+        b3, b4 = st.columns(2)
+        with b3, st.container(border=True):
+            st.subheader("Live duration by date")
+            fig, unit = stacked_bars(cur, "hrs", start, cur_e, split, ",.1f", " hrs")
+            st.caption(f"{cur_label} · actual live hours per {unit}")
+            st.plotly_chart(fig, width="stretch", key="dur_chart")
+        with b4, st.container(border=True):
+            st.subheader("Duration by live operate")
+            st.caption(cur_label)
+            t = perf_table(cur, lm, ly, "hrs", "Hours")
+            st.dataframe(style_table(t, ["Hours", "Last month", "Last year"], 1), hide_index=True,
+                         width="stretch")
+
+        with st.container(border=True):
+            st.subheader("Performance by live operate (detail)")
+            key = ["operate", "type", "channel", "account"]
+            agg = lambda d: d.groupby(key)[["gmv", "hrs"]].sum()
+            det = agg(cur).join(agg(lm), rsuffix="_lm", how="left").join(agg(ly), rsuffix="_ly", how="left").fillna(0)
+            det = det[(det.gmv > 0) | (det.hrs > 0)].sort_values("gmv", ascending=False).reset_index()
+            out = pd.DataFrame({
+                "Live operate": det.operate, "Type": det.type, "Channel": det.channel, "Account": det.account,
+                "GMV (THB)": det.gmv.round(0),
+                "GMV %CHG MoM": [fmt_pct(pct(a, b)) for a, b in zip(det.gmv, det.gmv_lm)],
+                "GMV %CHG YoY": [fmt_pct(pct(a, b)) for a, b in zip(det.gmv, det.gmv_ly)],
+                "Hours": det.hrs.round(1),
+                "Hrs %CHG MoM": [fmt_pct(pct(a, b)) for a, b in zip(det.hrs, det.hrs_lm)],
+                "Hrs %CHG YoY": [fmt_pct(pct(a, b)) for a, b in zip(det.hrs, det.hrs_ly)],
+                "GMV per hour": [round(a / b) if b else None for a, b in zip(det.gmv, det.hrs)],
+            })
+            color = lambda v: ("color:#1a9e5a" if str(v).startswith("+") else
+                               "color:#d64545" if str(v).startswith("-") else "")
+            st.dataframe(out.style.format({"GMV (THB)": "{:,.0f}", "Hours": "{:,.1f}", "GMV per hour": "{:,.0f}"},
+                                          na_rep="–").map(color, subset=[c for c in out.columns if "%CHG" in c]),
+                         hide_index=True, width="stretch", height=420)
+            st.caption("Supersports Performance results come from its monthly Perf sheets (or a Live Raw Data "
+                       "sheet in that file, if one is added). Aloshop hours count as Agency; the rest of that "
+                       "account counts as Internal MCs ('Other operators').")
 
 
-tab_a, tab_b = st.tabs(["A · Live Schedule", "B · Live Performance"])
-
-# ============================ A: LIVE SCHEDULE ============================
-G = {
-    "Total 2 channels": (0, lambda d: d.index == d.index),
-    "Shopee": (1, lambda d: d.channel == "Shopee"),
-    "Shopee · Supersports account": (2, lambda d: (d.channel == "Shopee") & (d.account == "Supersports")),
-    "Shopee · Supersports · Internal MCs": (3, lambda d: (d.channel == "Shopee") & (d.account == "Supersports") & (d.type == "Internal MCs")),
-    "Shopee · Supersports · Agency (Aloshop)": (3, lambda d: (d.channel == "Shopee") & (d.account == "Supersports") & (d.type == "Agency")),
-    "Shopee · Supersports · KOLs": (3, lambda d: (d.channel == "Shopee") & (d.account == "Supersports") & (d.type == "KOLs")),
-    "Shopee · SSP Livestream account": (2, lambda d: (d.channel == "Shopee") & (d.account == "SSP Livestream")),
-    "TikTok": (1, lambda d: d.channel == "TikTok"),
-    "TikTok · Supersports account": (2, lambda d: (d.channel == "TikTok") & (d.account == "Supersports")),
-    "TikTok · Supersports · Internal MCs": (3, lambda d: (d.channel == "TikTok") & (d.account == "Supersports") & (d.type == "Internal MCs")),
-    "TikTok · Supersports · Agency (Aloshop)": (3, lambda d: (d.channel == "TikTok") & (d.account == "Supersports") & (d.type == "Agency")),
-    "TikTok · Supersports Performance account": (2, lambda d: (d.channel == "TikTok") & (d.account == "Supersports Performance")),
-    "TikTok · KOLs accounts": (2, lambda d: (d.channel == "TikTok") & (d.account == "KOLs")),
-    "TikTok · Other own accounts (Football, Mahachai)": (2, lambda d: (d.channel == "TikTok") & d.account.isin(["Supersports Football", "Supersports Mahachai"])),
-}
-
-with tab_a:
-    st.subheader("Live schedule summary")
-    st.caption(ctx_label)
-    tot_h = S["plan_hrs"].sum()
-    k = st.columns(4)
-    k[0].metric("Total lives planned", f"{len(S):,}", help=f"{tot_h:,.1f} hrs · {S['date'].nunique()} live days")
-    for col, ch in ((k[1], "Shopee"), (k[2], "TikTok")):
-        d = S[S.channel == ch]
-        col.metric(f"{ch} lives", f"{len(d):,}", f"{d['plan_hrs'].sum():,.1f} hrs planned", delta_color="off")
-    shares = [S.loc[S.type == t, "plan_hrs"].sum() / tot_h if tot_h else 0 for t in ("Agency", "Internal MCs", "KOLs")]
-    k[3].metric("Agency · Internal MCs · KOLs (share of hrs)", " · ".join(f"{v:.0%}" for v in shares))
-
-    rows = []
-    for label, (lvl, f) in G.items():
-        d = S[f(S)]
-        n, h = len(d), d["plan_hrs"].sum()
-        rows.append({"Channel / account / live operate": ("    " * lvl) + label.split(" · ")[-1] if lvl else label,
-                     "Lives": n, "Planned hrs": round(h, 1), "Live days": d["date"].nunique(),
-                     "Avg hrs per live": round(h / n, 1) if n else None, "Share of hrs": f"{h / tot_h:.1%}" if tot_h and n else "–"})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=36 * (len(rows) + 1) + 4)
-
-    a1, a2 = st.columns(2)
-    with a1:
-        st.markdown("**Live plan by channel** (planned hours)")
-        bar_chart(S, "plan_hrs", start, end, "Planned hrs")
-    with a2:
-        st.markdown("**Live calendar** (lives per day)")
-        cal = S.groupby([S["date"].dt.date, "channel"]).size().unstack(fill_value=0)
-        cal["Hours"] = S.groupby(S["date"].dt.date)["plan_hrs"].sum().round(1)
-        cal.index = [d.strftime("%a %b %d") for d in cal.index]
-        st.dataframe(cal, width="stretch", height=320)
-
-    st.markdown("**Schedule by live operate**")
-    op = (S.groupby(["operate", "type", "channel", "account"], as_index=False)
-            .agg(Lives=("date", "size"), **{"Planned hrs": ("plan_hrs", "sum")})
-            .sort_values("Planned hrs", ascending=False))
-    op["Share of hrs"] = (op["Planned hrs"] / tot_h).map("{:.1%}".format) if tot_h else "–"
-    op["Planned hrs"] = op["Planned hrs"].round(1)
-    st.dataframe(op.rename(columns=str.title), hide_index=True, width="stretch")
-
-    st.markdown("**Daily live plan**")
-    q = st.text_input("Search date, operate or account", "")
-    lst = S.sort_values(["date", "start"]).assign(Date=lambda d: d["date"].dt.strftime("%a %b %d, %Y"),
-                                                   Time=lambda d: d["start"] + "–" + d["end"],
-                                                   **{"Planned hrs": lambda d: d["plan_hrs"].round(1)})
-    lst = lst[["Date", "Time", "channel", "account", "operate", "type", "Planned hrs"]].rename(columns=str.title)
-    if q:
-        lst = lst[lst.apply(lambda r: q.lower() in " ".join(map(str, r.values)).lower(), axis=1)]
-    st.dataframe(lst, hide_index=True, width="stretch", height=420)
-
-# ============================ B: LIVE PERFORMANCE ============================
-PG = [
-    ("Total 2 channels", lambda d: d.index == d.index),
-    ("Shopee", lambda d: d.channel == "Shopee"),
-    ("    Internal MCs", lambda d: (d.channel == "Shopee") & (d.type == "Internal MCs")),
-    ("    Agency", lambda d: (d.channel == "Shopee") & (d.type == "Agency")),
-    ("    KOLs", lambda d: (d.channel == "Shopee") & (d.type == "KOLs")),
-    ("TikTok", lambda d: d.channel == "TikTok"),
-    ("    Agency", lambda d: (d.channel == "TikTok") & (d.type == "Agency")),
-    ("    Internal MCs", lambda d: (d.channel == "TikTok") & (d.type == "Internal MCs")),
-    ("    KOLs", lambda d: (d.channel == "TikTok") & (d.type == "KOLs")),
-]
+dashboard(start, end, channel, typ, split)
 
 
-def perf_table(field: str, label: str, decimals: int):
-    tot = P[field].sum()
-    rows = []
-    for name, f in PG:
-        v, lm, ly = P.loc[f(P), field].sum(), PLM.loc[f(PLM), field].sum(), PLY.loc[f(PLY), field].sum()
-        r = lambda x: f"{x:,.{decimals}f}" if x else "–"
-        rows.append({"Live operate": name, label: r(v), "Share": f"{v / tot:.1%}" if tot and v else "–",
-                     "Last month": r(lm), "%CHG MoM": fmt_pct(pct(v, lm)),
-                     "Last year": r(ly), "%CHG YoY": fmt_pct(pct(v, ly))})
-    df = pd.DataFrame(rows)
-    sty = df.style.map(color_pct, subset=["%CHG MoM", "%CHG YoY"]).apply(
-        lambda r: ["font-weight: 700" if not r["Live operate"].startswith(" ") else "" for _ in r], axis=1)
-    st.dataframe(sty, hide_index=True, width="stretch", height=36 * (len(rows) + 1) + 4)
-
-
-with tab_b:
-    st.subheader("Live performance summary")
-    period_txt = "No results yet for this period" if no_results else f"{cur_s:%b %d} – {cur_e:%b %d, %Y}"
-    st.caption(f"{period_txt} · compared with {lm_s:%b %d} – {lm_e:%b %d, %Y} (last month) and "
-               f"{ly_s:%b %d} – {ly_e:%b %d, %Y} (last year). Results stop at {last_result:%b %d, %Y}.")
-
-    def tile(col, title, cur, lm, ly, money=True, suffix=""):
-        col.metric(title, thb(cur) if money else f"{cur:,.1f}{suffix}", f"MoM {fmt_pct(pct(cur, lm))}")
-        col.caption(f"YoY {fmt_pct(pct(cur, ly))}")
-
-    t = st.columns(5)
-    tile(t[0], "GMV, 2 channels", P.gmv.sum(), PLM.gmv.sum(), PLY.gmv.sum())
-    for col, ch in ((t[1], "Shopee"), (t[2], "TikTok")):
-        tile(col, f"{ch} GMV", P.loc[P.channel == ch, "gmv"].sum(), PLM.loc[PLM.channel == ch, "gmv"].sum(), PLY.loc[PLY.channel == ch, "gmv"].sum())
-    tile(t[3], "Live duration", P.hrs.sum(), PLM.hrs.sum(), PLY.hrs.sum(), money=False, suffix=" hrs")
-    gph = lambda d: d.gmv.sum() / d.hrs.sum() if d.hrs.sum() else 0
-    tile(t[4], "GMV per live hour", gph(P), gph(PLM), gph(PLY))
-
-    st.markdown("### 1 · GMV")
-    b1, b2 = st.columns(2)
-    with b1:
-        st.markdown("**GMV by date**")
-        bar_chart(P, "gmv", cur_s, cur_e if not no_results else end, "GMV (THB)", money=True)
-    with b2:
-        st.markdown("**GMV by live operate**")
-        perf_table("gmv", "GMV (THB)", 0)
-
-    st.markdown("### 2 · Duration")
-    b3, b4 = st.columns(2)
-    with b3:
-        st.markdown("**Live duration by date**")
-        bar_chart(P, "hrs", cur_s, cur_e if not no_results else end, "Hours")
-    with b4:
-        st.markdown("**Duration by live operate**")
-        perf_table("hrs", "Hours", 1)
-
-    st.markdown("**Performance by live operate (detail)**")
-    keys = ["operate", "type", "channel", "account"]
-    cur = P.groupby(keys)[["gmv", "hrs"]].sum()
-    lm = PLM.groupby(keys)[["gmv", "hrs"]].sum().add_suffix("_lm")
-    ly = PLY.groupby(keys)[["gmv", "hrs"]].sum().add_suffix("_ly")
-    det = cur.join(lm, how="left").join(ly, how="left").fillna(0).reset_index().sort_values("gmv", ascending=False)
-    out = pd.DataFrame({
-        "Live operate": det.operate, "Type": det.type, "Channel": det.channel, "Account": det.account,
-        "GMV (THB)": det.gmv.map("{:,.0f}".format),
-        "GMV %CHG MoM": [fmt_pct(pct(a, b)) for a, b in zip(det.gmv, det.gmv_lm)],
-        "GMV %CHG YoY": [fmt_pct(pct(a, b)) for a, b in zip(det.gmv, det.gmv_ly)],
-        "Hours": det.hrs.map("{:,.1f}".format),
-        "Hours %CHG MoM": [fmt_pct(pct(a, b)) for a, b in zip(det.hrs, det.hrs_lm)],
-        "Hours %CHG YoY": [fmt_pct(pct(a, b)) for a, b in zip(det.hrs, det.hrs_ly)],
-        "GMV per hour": [f"{a / b:,.0f}" if b else "–" for a, b in zip(det.gmv, det.hrs)],
-    })
-    st.dataframe(out.style.map(color_pct, subset=[c for c in out.columns if "%CHG" in c]),
-                 hide_index=True, width="stretch", height=420)
-
-    for n in notes:
-        st.caption(n)
-    st.caption("Shopee duration is the actual live duration from 'Report - By Live'. TikTok duration is from 'Live Raw Data'. "
-               "'NSQ' is shown as 'Aloshop'.")
+# ----------------------------------------------------------------------------
+# README
+# ----------------------------------------------------------------------------
+# 1) requirements.txt
+#       streamlit>=1.48
+#       pandas
+#       plotly
+#       gspread>=6
+#       google-auth
+#
+# 2) Google service account (one time)
+#    - Google Cloud Console > create a project > enable "Google Sheets API".
+#    - IAM & Admin > Service accounts > create one > Keys > Add key > JSON. Download the file.
+#    - Share each of the 3 Google Sheets with the service account's email
+#      (xxx@yyy.iam.gserviceaccount.com) as Viewer.
+#
+# 3) Secrets: put the JSON key into .streamlit/secrets.toml (local) or the app's
+#    Secrets box on Streamlit Community Cloud:
+#
+#       [gcp_service_account]
+#       type = "service_account"
+#       project_id = "..."
+#       private_key_id = "..."
+#       private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+#       client_email = "...@....iam.gserviceaccount.com"
+#       client_id = "..."
+#       auth_uri = "https://accounts.google.com/o/oauth2/auth"
+#       token_uri = "https://oauth2.googleapis.com/token"
+#       auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+#       client_x509_cert_url = "..."
+#
+# 4) Run:  streamlit run streamlit_app.py
+#
+# Auto update: data is cached for REFRESH_MINUTES and the dashboard re-runs on that
+# interval, so edits in Google Sheets appear within ~5 minutes. "Refresh data now"
+# in the sidebar reloads immediately.
