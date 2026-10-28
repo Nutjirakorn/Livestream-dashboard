@@ -323,14 +323,8 @@ def build_all(shopee_rows, cal_rows, raw_rows, tpl_rows, perf_sheets, perf_raw_r
 def gs_client():
     import gspread
     from google.oauth2.service_account import Credentials
-    
-    # Process secrets dictionary to properly format private key line breaks
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    if "private_key" in creds_dict:
-        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-        
     creds = Credentials.from_service_account_info(
-        creds_dict,
+        dict(st.secrets["gcp_service_account"]),
         scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     return gspread.authorize(creds)
 
@@ -763,3 +757,41 @@ def dashboard(start, end, channel, typ, split):
 
 
 dashboard(start, end, channel, typ, split)
+
+
+# ----------------------------------------------------------------------------
+# README
+# ----------------------------------------------------------------------------
+# 1) requirements.txt
+#       streamlit>=1.48
+#       pandas
+#       plotly
+#       gspread>=6
+#       google-auth
+#
+# 2) Google service account (one time)
+#    - Google Cloud Console > create a project > enable "Google Sheets API".
+#    - IAM & Admin > Service accounts > create one > Keys > Add key > JSON. Download the file.
+#    - Share each of the 3 Google Sheets with the service account's email
+#      (xxx@yyy.iam.gserviceaccount.com) as Viewer.
+#
+# 3) Secrets: put the JSON key into .streamlit/secrets.toml (local) or the app's
+#    Secrets box on Streamlit Community Cloud:
+#
+#       [gcp_service_account]
+#       type = "service_account"
+#       project_id = "..."
+#       private_key_id = "..."
+#       private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+#       client_email = "...@....iam.gserviceaccount.com"
+#       client_id = "..."
+#       auth_uri = "https://accounts.google.com/o/oauth2/auth"
+#       token_uri = "https://oauth2.googleapis.com/token"
+#       auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+#       client_x509_cert_url = "..."
+#
+# 4) Run:  streamlit run streamlit_app.py
+#
+# Auto update: data is cached for REFRESH_MINUTES and the dashboard re-runs on that
+# interval, so edits in Google Sheets appear within ~5 minutes. "Refresh data now"
+# in the sidebar reloads immediately.
