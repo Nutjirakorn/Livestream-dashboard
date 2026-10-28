@@ -319,13 +319,62 @@ def build_all(shopee_rows, cal_rows, raw_rows, tpl_rows, perf_sheets, perf_raw_r
 # ----------------------------------------------------------------------------
 # Google Sheets loading (cached; re-read every REFRESH_MINUTES)
 # ----------------------------------------------------------------------------
+class SetupError(Exception):
+    """A problem with the Google key setup, shown to the user as setup steps."""
+
+
+def _secrets_dict():
+    try:
+        return {k: st.secrets[k] for k in st.secrets.keys()}
+    except Exception:          # no secrets.toml anywhere
+        return {}
+
+
+def service_account_info():
+    """Find the service account key. Accepts, in order:
+    1. [gcp_service_account] section in secrets (TOML keys)
+    2. gcp_service_account = '''{ ...JSON... }''' (the JSON key pasted as one string)
+    3. [connections.gsheets] section (st-gsheets-connection style)
+    4. the key's fields at the top level of secrets (pasted without a section header)
+    5. a service_account.json file next to this app, or GOOGLE_APPLICATION_CREDENTIALS
+    """
+    import json
+    import os
+    from pathlib import Path
+
+    sec = _secrets_dict()
+    v = sec.get("gcp_service_account")
+    if v is not None:
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError as e:
+                raise SetupError("gcp_service_account is text but not valid JSON") from e
+        return dict(v)
+    conn = sec.get("connections")
+    if conn is not None and "gsheets" in conn:
+        return {k: val for k, val in dict(conn["gsheets"]).items() if k not in ("spreadsheet", "worksheet")}
+    if "private_key" in sec and "client_email" in sec:
+        return {k: sec[k] for k in sec if not hasattr(sec[k], "keys")}
+    for p in [Path(__file__).with_name("service_account.json"), Path(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", ""))]:
+        if p.name and p.is_file():
+            return json.loads(p.read_text())
+    found = ", ".join(sorted(sec)) or "nothing"
+    raise SetupError(
+        f"No Google service account key found (secrets contain: {found}). Streamlit reads secrets only from "
+        f"`.streamlit/secrets.toml` in the folder you run `streamlit run` from (now: `{Path.cwd()}`), from "
+        "`~/.streamlit/secrets.toml`, or from the Secrets box on Streamlit Community Cloud.")
+
+
 @st.cache_resource
 def gs_client():
     import gspread
     from google.oauth2.service_account import Credentials
+    info = service_account_info()
+    if "private_key" in info:      # TOML editors sometimes turn \n into real line breaks or keep a literal "\\n"
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
     creds = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]),
-        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+        info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     return gspread.authorize(creds)
 
 
@@ -571,9 +620,34 @@ st.title("Supersports Live Schedule & Performance")
 
 try:
     S_all, P_all, loaded_at = load_data()
+except SetupError as exc:
+    st.error(f"**Google key not set up.** {exc}")
+    st.markdown(
+        "Add this to `.streamlit/secrets.toml` (note the folder name starts with a dot and the file must not "
+        "end in `.example`), filling in the values from your service account JSON key file:")
+    st.code('[gcp_service_account]\ntype = "service_account"\nproject_id = "..."\nprivate_key_id = "..."\n'
+            'private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"\n'
+            'client_email = "...@....iam.gserviceaccount.com"\nclient_id = "..."\n'
+            'token_uri = "https://oauth2.googleapis.com/token"', language="toml")
+    st.markdown("Or paste the whole JSON file as one value:")
+    st.code("gcp_service_account = '''\n{ paste the JSON key file here }\n'''", language="toml")
+    st.markdown("Or save the JSON key file as `service_account.json` next to `streamlit_app.py`. "
+                "On Streamlit Community Cloud, paste the TOML into **App settings > Secrets**, then reboot the app.")
+    st.stop()
 except Exception as exc:  # show a readable message instead of a stack trace
-    st.error(f"Couldn't read the Google Sheets: {exc}. Check that each sheet is shared with the "
-             "service account email in your secrets.")
+    import gspread
+    if isinstance(exc, gspread.exceptions.SpreadsheetNotFound) or "403" in str(exc) or "PERMISSION" in str(exc).upper():
+        try:
+            email = service_account_info().get("client_email", "the service account email")
+        except Exception:
+            email = "the service account email"
+        st.error(f"**No access to a Google Sheet.** Share all 3 sheets with `{email}` as Viewer, and make sure "
+                 "the Google Sheets API is turned on in that Google Cloud project.")
+    elif isinstance(exc, gspread.exceptions.WorksheetNotFound):
+        st.error(f"**A sheet tab is missing:** {exc}. Check the tab names: 'Report - By Live', "
+                 "'Daily Live Calendar', 'Live Raw Data', 'Live Template(NEW)'.")
+    else:
+        st.error(f"Couldn't read the Google Sheets: {type(exc).__name__}: {exc}")
     st.stop()
 
 # ---- Sidebar filters
