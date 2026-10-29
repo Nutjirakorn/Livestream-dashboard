@@ -441,7 +441,7 @@ def preset_range(p, today):
 
 
 def fmt_range(s, e):
-    return f"{s:%b %-d} – {e:%b %-d, %Y}" if s.year == e.year else f"{s:%b %-d, %Y} – {e:%b %-d, %Y}"
+    return f"{s:%b %-d} to {e:%b %-d, %Y}" if s.year == e.year else f"{s:%b %-d, %Y} to {e:%b %-d, %Y}"
 
 
 def pct(a, b):
@@ -507,7 +507,7 @@ def schedule_table(d):
         out.append({"Channel / account / live operate": INDENT[lvl] + label,
                     "Lives": n, "Planned hrs": round(h, 1), "Live days": x.date.nunique(),
                     "Avg hrs per live": round(h / n, 1) if n else None,
-                    "Share of hrs": f"{h / total_hrs:.1%}" if total_hrs and n else "–", "_lvl": lvl})
+                    "Share of hrs": f"{h / total_hrs:.1%}" if total_hrs and n else "-", "_lvl": lvl})
     return pd.DataFrame(out)
 
 
@@ -518,7 +518,7 @@ def perf_table(cur, lm, ly, field, label):
         v, a, b = f(cur)[field].sum(), f(lm)[field].sum(), f(ly)[field].sum()
         r = 0 if field == "gmv" else 1
         out.append({"Live operate": INDENT[lvl] + name, label: round(v, r),
-                    "Share": f"{v / tot:.1%}" if tot and v else "–",
+                    "Share": f"{v / tot:.1%}" if tot and v else "-",
                     "Last month": round(a, r), "%CHG MoM": fmt_pct(pct(v, a)),
                     "Last year": round(b, r), "%CHG YoY": fmt_pct(pct(v, b)), "_lvl": lvl})
     return pd.DataFrame(out)
@@ -545,7 +545,7 @@ def style_table(df, num_cols, decimals=0):
 
     sty = show.style.apply(row_style, axis=1).format(
         {c: (f"{{:,.{decimals}f}}" if c not in ("Lives", "Live days") else "{:,.0f}") for c in num_cols},
-        na_rep="–")
+        na_rep="-")
     chg_cols = [c for c in show.columns if c.startswith("%CHG")]
     if chg_cols:
         sty = sty.map(chg_color, subset=chg_cols)
@@ -658,7 +658,7 @@ with st.sidebar:
                                      "This year", "Last year", "Custom dates"])
     if preset == "Custom dates":
         ps, pe = preset_range("This month", today)
-        picked = st.date_input("From – To", (ps, pe))
+        picked = st.date_input("From / To", (ps, pe))
         start, end = (picked if isinstance(picked, (list, tuple)) and len(picked) == 2 else (ps, pe))
     else:
         start, end = preset_range(preset, today)
@@ -716,7 +716,7 @@ def dashboard(start, end, channel, typ, split):
                       f"{tot_h:,.1f} hrs · {sched.date.nunique()} live days", delta_color="off")
             c2.metric("Shopee", f"{len(sh):,}", f"{sh.plan_hrs.sum():,.1f} hrs planned", delta_color="off")
             c3.metric("TikTok", f"{len(tt):,}", f"{tt.plan_hrs.sum():,.1f} hrs planned", delta_color="off")
-            shares = " · ".join(f"{sched[sched.type == t].plan_hrs.sum() / tot_h:.0%}" if tot_h else "–" for t in TYPES)
+            shares = " · ".join(f"{sched[sched.type == t].plan_hrs.sum() / tot_h:.0%}" if tot_h else "-" for t in TYPES)
             c4.metric("Agency · Internal MCs · KOLs", shares, "share of planned hours", delta_color="off")
             st.dataframe(style_table(schedule_table(sched), ["Lives", "Planned hrs", "Live days", "Avg hrs per live"], 1),
                          hide_index=True, width="stretch")
@@ -737,7 +737,7 @@ def dashboard(start, end, channel, typ, split):
             g = (sched.groupby(["operate", "type", "channel", "account"], as_index=False)
                  .agg(Lives=("date", "size"), **{"Planned hrs": ("plan_hrs", "sum")})
                  .sort_values("Planned hrs", ascending=False))
-            g["Share of hrs"] = (g["Planned hrs"] / tot_h).map("{:.1%}".format) if tot_h else "–"
+            g["Share of hrs"] = (g["Planned hrs"] / tot_h).map("{:.1%}".format) if tot_h else "-"
             g.columns = ["Live operate", "Type", "Channel", "Account", "Lives", "Planned hrs", "Share of hrs"]
             st.dataframe(g.style.format({"Planned hrs": "{:,.1f}"}), hide_index=True, width="stretch")
 
@@ -746,7 +746,7 @@ def dashboard(start, end, channel, typ, split):
             q = st.text_input("Search date, operate or account", key="q")
             lst = sched.sort_values(["date", "start"]).assign(
                 Date=lambda x: x.date.dt.strftime("%a %b %-d, %Y"),
-                Time=lambda x: x.start + "–" + x.end)
+                Time=lambda x: x.start + " - " + x.end)
             lst = lst[["Date", "Time", "channel", "account", "operate", "type", "plan_hrs"]]
             lst.columns = ["Date", "Time", "Channel", "Account", "Live operate", "Type", "Planned hrs"]
             if q:
@@ -804,6 +804,33 @@ def dashboard(start, end, channel, typ, split):
             st.dataframe(style_table(t, ["Hours", "Last month", "Last year"], 1), hide_index=True,
                          width="stretch")
 
+        st.markdown("#### 3 · TikTok by account")
+        with st.container(border=True):
+            st.subheader("TikTok GMV and duration by account")
+            st.caption(cur_label)
+            acc_rows = [("TikTok", 1, lambda d: d[d.channel == "TikTok"]),
+                        ("Supersports account", 2, lambda d: d[(d.channel == "TikTok") & (d.account == "Supersports")]),
+                        ("Supersports Performance account", 2,
+                         lambda d: d[(d.channel == "TikTok") & (d.account == "Supersports Performance")]),
+                        ("KOLs accounts", 2, lambda d: d[(d.channel == "TikTok") & (d.account == "KOLs")]),
+                        ("Other own accounts (Football, Mahachai)", 2,
+                         lambda d: d[(d.channel == "TikTok") & d.account.isin(["Supersports Football", "Supersports Mahachai"])])]
+            acc = []
+            for name, lvl, f in acc_rows:
+                c0, c1, c2, allr = f(cur), f(lm), f(ly), f(P)
+                lastd = allr.loc[(allr.gmv > 0) | (allr.hrs > 0), "date"].max()
+                acc.append({"Account": INDENT[lvl] + name, "GMV (THB)": round(c0.gmv.sum()),
+                            "GMV %CHG MoM": fmt_pct(pct(c0.gmv.sum(), c1.gmv.sum())),
+                            "GMV %CHG YoY": fmt_pct(pct(c0.gmv.sum(), c2.gmv.sum())),
+                            "Hours": round(c0.hrs.sum(), 1),
+                            "Hrs %CHG MoM": fmt_pct(pct(c0.hrs.sum(), c1.hrs.sum())),
+                            "Hrs %CHG YoY": fmt_pct(pct(c0.hrs.sum(), c2.hrs.sum())),
+                            "Results up to": f"{lastd:%b %-d, %Y}" if pd.notna(lastd) else "No results", "_lvl": lvl})
+            st.dataframe(style_table(pd.DataFrame(acc), ["GMV (THB)", "Hours"], 0).format({"Hours": "{:,.1f}"}),
+                         hide_index=True, width="stretch")
+            st.caption("'Results up to' shows the latest date with results for each account, so a gap in a source "
+                       "sheet (for example missing monthly Perf sheets) is easy to spot.")
+
         with st.container(border=True):
             st.subheader("Performance by live operate (detail)")
             key = ["operate", "type", "channel", "account"]
@@ -823,7 +850,7 @@ def dashboard(start, end, channel, typ, split):
             color = lambda v: ("color:#1a9e5a" if str(v).startswith("+") else
                                "color:#d64545" if str(v).startswith("-") else "")
             st.dataframe(out.style.format({"GMV (THB)": "{:,.0f}", "Hours": "{:,.1f}", "GMV per hour": "{:,.0f}"},
-                                          na_rep="–").map(color, subset=[c for c in out.columns if "%CHG" in c]),
+                                          na_rep="-").map(color, subset=[c for c in out.columns if "%CHG" in c]),
                          hide_index=True, width="stretch", height=420)
             st.caption("Supersports Performance results come from its monthly Perf sheets (or a Live Raw Data "
                        "sheet in that file, if one is added). Aloshop hours count as Agency; the rest of that "
