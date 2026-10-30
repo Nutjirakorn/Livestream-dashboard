@@ -248,14 +248,18 @@ def perf_sheet_month(title, default_year=2025):
     if not m or m[1][:3].lower() not in MONTHS:
         return None
     return (2000 + int(m[2])) if m[2] else default_year, MONTHS[m[1][:3].lower()]
-
-
-def _match_col(row, target, start=0):
-    for i in range(start, len(row)):
-        tol = 3 if target >= 1000 else 0.01      # GMV may differ by a few baht of rounding; hours must match
-        if target and abs(num(row[i]) - target) <= tol:
-            return i
-    return None
+def gs_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
+    info = service_account_info()
+    if "private_key" in info and isinstance(info["private_key"], str):
+        # Fix backslash-n string replacements safely
+        pk = info["private_key"].replace("\\n", "\n")
+        # Ensure header and footer are clean
+        info["private_key"] = pk
+    creds = Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    return gspread.authorize(creds)
 
 
 def build_perf_monthly(title, rows):
